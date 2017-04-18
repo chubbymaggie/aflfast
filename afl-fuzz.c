@@ -252,13 +252,14 @@ struct queue_entry {
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
-  struct queue_entry *next;           /* Next element, if any             */
-
+  struct queue_entry *next,           /* Next element, if any             */
+                     *next_100;       /* 100 elements ahead               */
 };
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
-                          *queue_top; /* Top of the list                  */
+                          *queue_top, /* Top of the list                  */
+                          *q_prev100; /* Previous 100 marker              */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
@@ -327,89 +328,17 @@ enum {
 static u32 next_p2(u32 val);
 
 KHASH_MAP_INIT_INT(32,u32)
-khash_t(32) *cksum2paths;
+khash_t(32) *cksum2fuzz;
 
-static u32 getPaths(u32 key_cksum){
+static u32 getFuzz(u32 key_cksum){
 
-  khiter_t k = kh_get(32, cksum2paths, key_cksum);
+  khiter_t k = kh_get(32, cksum2fuzz, key_cksum);
 
-  if (k != kh_end(cksum2paths)){
-    return kh_value(cksum2paths, k);
+  if (k != kh_end(cksum2fuzz)){
+    return kh_value(cksum2fuzz, k);
   } else {
     return 0;
   }
-}
-
-static void chooseNext_queue_cur() {
-
-  if (!queue_cur) return;
-
-  struct queue_entry *prev_queue_cur = queue_cur;
-  queue_cur = queue_cur->next;
-  if (!queue_cur) return;
-
-  struct queue_entry *queue_it       = queue_cur;
-  struct queue_entry *bestEntry_prev = NULL;
-  struct queue_entry *bestEntry      = queue_cur;
-  u32 bestEntry_level                = queue_cur->fuzz_level;
-  u32 bestEntry_paths                = getPaths(queue_cur->exec_cksum);
-
-  u32 queued_paths_now = 0;
-  queue_it = queue;
-  while (queue_it) {
-    queued_paths_now ++;
-    queue_it = queue_it->next;
-  }
-
-  if (queued_paths_now != queued_paths) {
-    queued_paths = queued_paths_now;
-  }
-
-  queue_it=queue_cur;
-
-  while (queue_it->next) {
-    if (queue_it->next->fuzz_level < bestEntry_level
-        || (queue_it->next->fuzz_level == bestEntry_level
-            && getPaths(queue_it->next->exec_cksum) < bestEntry_paths)) {
-      bestEntry_prev  = queue_it;
-      bestEntry       = queue_it->next;
-      bestEntry_paths = getPaths(bestEntry->exec_cksum);
-      bestEntry_level = bestEntry->fuzz_level;
-    }
-    queue_it = queue_it->next;
-  }
-
-  /* Make bestEntry new head */
-  if (bestEntry->exec_cksum != queue_cur->exec_cksum){
-
-    /* Remove bestEntry and make head */
-    if (bestEntry->next)
-      bestEntry_prev->next = bestEntry->next;
-    else if (bestEntry != queue_top)
-      PFATAL("BEST_ENTRY without next != QUEUE_TOP");
-    /* Repair queue_top */
-    else {
-      queue_top = bestEntry_prev;
-      bestEntry_prev->next = NULL;
-    }
-
-    bestEntry->next = queue_cur;
-    queue_cur = bestEntry;
-
-    /* Link new head up with previous */
-    prev_queue_cur->next = queue_cur;
-  }
-
-  queued_paths_now = 0;
-  queue_it = queue;
-  while (queue_it) {
-    queued_paths_now ++;
-    queue_it = queue_it->next;
-  }
-  if (queued_paths_now != queued_paths) {
-    queued_paths = queued_paths_now;
-  }
-
 }
 
 
@@ -880,12 +809,19 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     queue_top->next = q;
     queue_top = q;
 
-  } else queue = queue_top = q;
+  } else q_prev100 = queue = queue_top = q;
 
   queued_paths++;
   pending_not_fuzzed++;
 
   cycles_wo_finds = 0;
+
+  if (!(queued_paths % 100)) {
+
+    q_prev100->next_100 = q;
+    q_prev100 = q;
+
+  }
 
   last_path_time = get_cur_time();
 
@@ -1321,8 +1257,7 @@ static void minimize_bits(u8* dst, u8* src) {
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
-  u32 fuzz_level = q->fuzz_level;
-  u32 paths      = getPaths(q->exec_cksum);
+  u32 fuzz_p2      = next_p2 (getFuzz(q->exec_cksum));
   u64 fav_factor = q->exec_us * q->len;
 
   /* For every byte set in trace_bits[], see if there is a previous winner,
@@ -1334,19 +1269,13 @@ static void update_bitmap_score(struct queue_entry* q) {
 
        if (top_rated[i]) {
 
-         u32 top_rated_fuzz_level = top_rated[i]->fuzz_level;
-         u32 top_rated_paths      = getPaths(top_rated[i]->exec_cksum);
-         u64 top_rated_fav_factor = fav_factor > top_rated[i]->exec_us * top_rated[i]->len;
+         u32 top_rated_fuzz_p2    = next_p2 (getFuzz(top_rated[i]->exec_cksum));
+         u64 top_rated_fav_factor = top_rated[i]->exec_us * top_rated[i]->len;
 
-         if (fuzz_level > top_rated_fuzz_level) continue;
-         else if (fuzz_level == top_rated_fuzz_level) {
+         if (fuzz_p2 > top_rated_fuzz_p2) continue;
+         else if (fuzz_p2 == top_rated_fuzz_p2) {
 
-           if (paths > top_rated_paths) continue;
-           else if (next_p2 (paths) == next_p2 (top_rated_paths)) {
-
-             if (fav_factor > top_rated_fav_factor) continue;
-
-           }
+           if (fav_factor > top_rated_fav_factor) continue;
 
          }
 
@@ -1422,7 +1351,7 @@ static void cull_queue(void) {
       top_rated[i]->favored = 1;
       queued_favored++;
 
-      if (!top_rated[i]->fuzz_level == 0) pending_favored++;
+      if (top_rated[i]->fuzz_level == 0) pending_favored++;
 
     }
 
@@ -3220,9 +3149,9 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   /* Update path frequency. */
   khiter_t k;
   u32 key_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-  k = kh_get(32, cksum2paths, key_cksum);
-  if (k != kh_end(cksum2paths)){
-    ++kh_value(cksum2paths, k);
+  k = kh_get(32, cksum2fuzz, key_cksum);
+  if (k != kh_end(cksum2fuzz)){
+    kh_value(cksum2fuzz, k) ++;
   }
 
   if (fault == crash_mode) {
@@ -3256,9 +3185,9 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     queue_top->exec_cksum = key_cksum;
 
     int ret;
-    if (k == kh_end (cksum2paths)) {
-      k = kh_put (32, cksum2paths, key_cksum, &ret);
-      kh_value (cksum2paths, k) = 1;
+    if (k == kh_end (cksum2fuzz)) {
+      k = kh_put (32, cksum2fuzz, key_cksum, &ret);
+      kh_value (cksum2fuzz, k) = 1;
     }
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
@@ -4025,7 +3954,7 @@ static void show_stats(void) {
 
   /* Honor AFL_EXIT_WHEN_DONE and AFL_BENCH_UNTIL_CRASH. */
 
-  if (!dumb_mode && cycles_wo_finds > 20 && !pending_not_fuzzed &&
+  if (!dumb_mode && cycles_wo_finds > 100 && !pending_not_fuzzed &&
       getenv("AFL_EXIT_WHEN_DONE")) stop_soon = 2;
 
   if (total_crashes && getenv("AFL_BENCH_UNTIL_CRASH")) stop_soon = 2;
@@ -4099,10 +4028,10 @@ static void show_stats(void) {
     if (queue_cycle == 1) strcpy(tmp, cMGN); else
 
     /* Subsequent cycles, but we're still making finds. */
-    if (cycles_wo_finds < 3) strcpy(tmp, cYEL); else
+    if (cycles_wo_finds < 25) strcpy(tmp, cYEL); else
 
     /* No finds for a long time and no test cases to try. */
-    if (cycles_wo_finds > 20 && !pending_not_fuzzed) strcpy(tmp, cLGN);
+    if (cycles_wo_finds > 100 && !pending_not_fuzzed) strcpy(tmp, cLGN);
 
     /* Default: cautiously OK to stop? */
     else strcpy(tmp, cLBL);
@@ -4788,19 +4717,22 @@ static u32 calculate_score(struct queue_entry* q) {
 
     case 0 ... 3:   break;
     case 4 ... 7:   perf_score *= 2; break;
-    case 8 ... 13:  perf_score *= 4; break;
-    case 14 ... 25: perf_score *= 6; break;
-    default:        perf_score *= 8;
+    case 8 ... 13:  perf_score *= 3; break;
+    case 14 ... 25: perf_score *= 4; break;
+    default:        perf_score *= 5;
 
   }
 
-  u32 fuzz = getPaths(q->exec_cksum);
+  u32 fuzz = getFuzz(q->exec_cksum);
   u32 fuzz_total, n_paths, fuzz_mu;
+  u32 factor = 1;
   switch (schedule) {
 
-    case EXPLORE:
-      perf_score = (u32) perf_score / POWER_BETA;
-      if (perf_score < HAVOC_MIN) perf_score = HAVOC_MIN;
+    case EXPLORE: 
+      break;
+
+    case EXPLOIT:
+      factor = MAX_FACTOR;
       break;
 
     case COE:
@@ -4809,40 +4741,44 @@ static u32 calculate_score(struct queue_entry* q) {
 
       struct queue_entry *queue_it = queue;	
       while (queue_it) {
-        fuzz_total += getPaths(queue_it->exec_cksum);
+        fuzz_total += getFuzz(queue_it->exec_cksum);
         n_paths ++;
         queue_it = queue_it -> next;
       }
 
       fuzz_mu = fuzz_total / n_paths;
       if (fuzz <= fuzz_mu) {
-        perf_score = perf_score * ((u32) ( 1 << q->fuzz_level)) / POWER_BETA;
+        if (q->fuzz_level < 16)
+          factor = ((u32) (1 << q->fuzz_level));
+        else 
+          factor = MAX_FACTOR;
       } else {
-        perf_score = 0;
+        factor = 0;
       }
       break;
-
+    
     case FAST:
-      perf_score = perf_score * ((u32) ( 1 << q->fuzz_level))
-                              / (POWER_BETA * (fuzz == 0 ? 1 : fuzz));
+      if (q->fuzz_level < 16) {
+         factor = ((u32) (1 << q->fuzz_level)) / (fuzz == 0 ? 1 : fuzz); 
+      } else
+        factor = MAX_FACTOR / (fuzz == 0 ? 1 : next_p2 (fuzz));
       break;
 
     case LIN:
-      perf_score = perf_score * ((u32) q->fuzz_level)
-                              / (POWER_BETA * (fuzz == 0 ? 1 : fuzz));
+      factor = q->fuzz_level / (fuzz == 0 ? 1 : fuzz); 
       break;
 
     case QUAD:
-      perf_score = perf_score * ((u32) (q->fuzz_level)*(q->fuzz_level))
-                              / (POWER_BETA * (fuzz == 0 ? 1 : fuzz));
-    break;
-
-    case EXPLOIT: /* AFL's exploitation-based constant power schedule */
+      factor = q->fuzz_level * q->fuzz_level / (fuzz == 0 ? 1 : fuzz);
       break;
+
     default:
       PFATAL ("Unkown Power Schedule");
   }
+  if (factor > MAX_FACTOR) 
+    factor = MAX_FACTOR;
 
+  perf_score *= factor / POWER_BETA;
 
   /* Make sure that we don't go over limit. */
 
@@ -4858,7 +4794,7 @@ static u32 calculate_score(struct queue_entry* q) {
    attempted by afl-fuzz. This is used to avoid dupes in some of the
    deterministic fuzzing operations that follow bit flips. We also
    return 1 if xor_val is zero, which implies that the old and attempted new
-   values are identical and the exec would be a waste of time. */
+   vales are identical and the exec would be a waste of time. */
 
 static u8 could_be_bitflip(u32 xor_val) {
 
@@ -5047,10 +4983,10 @@ static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
-  u64 orig_hit_cnt, new_hit_cnt;
+  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
-  u8  ret_val = 1;
+  u8  ret_val = 1, doing_det = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
@@ -5070,15 +5006,34 @@ static u8 fuzz_one(char** argv) {
        possibly skip to them at the expense of already-fuzzed or non-favored
        cases. */
 
-    if (!queue_cur->favored &&
+    if ((queue_cur->fuzz_level > 0 || !queue_cur->favored) &&
         UR(100) < SKIP_TO_NEW_PROB) return 1;
+
+  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+
+    /* Otherwise, still possibly skip non-favored cases, albeit less often.
+       The odds of skipping stuff are higher for already-fuzzed inputs and
+       lower for never-fuzzed entries. */
+
+    if (queue_cycle > 1 && queue_cur->fuzz_level == 0) {
+
+      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+
+    } else {
+
+      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
+
+    }
 
   }
 
 #endif /* ^IGNORE_FINDS */
 
-  if (not_on_tty)
-    ACTF("Fuzzing test case #%u (%u total)...", current_entry, queued_paths);
+  if (not_on_tty) {
+    ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
+         current_entry, queued_paths, unique_crashes);
+    fflush(stdout);
+  }
 
   /* Map the test case into memory. */
 
@@ -5160,14 +5115,20 @@ static u8 fuzz_one(char** argv) {
 
   orig_perf = perf_score = calculate_score(queue_cur);
 
-  if (perf_score < 10) goto abandon_entry;
+  if (perf_score == 0) goto abandon_entry;
 
   /* Skip right away if -d is given, if it has not been chosen sufficiently
      often to warrant the expensive deterministic stage (fuzz_level), or
      if it has gone through deterministic testing in earlier, resumed runs
      (passed_det). */
 
-  if (skip_deterministic || queue_cur->fuzz_level != 8 || queue_cur->passed_det)
+  if (skip_deterministic 
+     || ((!queue_cur->passed_det) 
+        && perf_score < (
+              queue_cur->depth * 30 <= HAVOC_MAX_MULT * 100
+              ? queue_cur->depth * 30 
+              : HAVOC_MAX_MULT * 100))
+     || queue_cur->passed_det)
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
@@ -5175,6 +5136,8 @@ static u8 fuzz_one(char** argv) {
 
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
     goto havoc_stage;
+
+  doing_det = 1;
 
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
@@ -5281,8 +5244,6 @@ static u8 fuzz_one(char** argv) {
 
   stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP1] += stage_max;
-
-  if (queue_cur->passed_det) goto havoc_stage;
 
   /* Two walking bits. */
 
@@ -6146,7 +6107,8 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = HAVOC_CYCLES * perf_score / havoc_div / 100;
+    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+                  perf_score / havoc_div / 100;
 
   } else {
 
@@ -6166,6 +6128,8 @@ havoc_stage:
   temp_len = len;
 
   orig_hit_cnt = queued_paths + unique_crashes;
+
+  havoc_queued = queued_paths;
 
   /* We essentially just do several thousand runs (depending on perf_score)
      where we take the input file and make random stacked tweaks. */
@@ -6548,6 +6512,19 @@ havoc_stage:
     temp_len = len;
     memcpy(out_buf, in_buf, len);
 
+    /* If we're finding new stuff, let's run for a bit longer, limits
+       permitting. */
+
+    if (queued_paths != havoc_queued) {
+
+      if (perf_score <= HAVOC_MAX_MULT * 100) {
+        stage_max  *= 2;
+        perf_score *= 2;
+      }
+
+      havoc_queued = queued_paths;
+
+    }
   }
 
   new_hit_cnt = queued_paths + unique_crashes;
@@ -6597,7 +6574,8 @@ retry_splicing:
     splicing_with = tid;
     target = queue;
 
-    while (tid-- && target->next) target = target->next;
+    while (tid >= 100) { target = target->next_100; tid -= 100; }
+    while (tid--) target = target->next;
 
     /* Make sure that the target has a reasonable length. */
 
@@ -7061,6 +7039,12 @@ static void check_if_tty(void) {
 
   struct winsize ws;
 
+  if (getenv("AFL_NO_UI")) {
+    OKF("Disabling the UI because AFL_NO_UI is set.");
+    not_on_tty = 1;
+    return;
+  }
+
   if (ioctl(1, TIOCGWINSZ, &ws)) {
 
     if (errno == ENOTTY) {
@@ -7449,8 +7433,9 @@ static void get_core_count(void) {
 
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
-    OKF("You have %u CPU cores and %u runnable tasks (utilization: %0.0f%%).",
-        cpu_core_count, cur_runnable, cur_runnable * 100.0 / cpu_core_count);
+    OKF("You have %u CPU core%s and %u runnable tasks (utilization: %0.0f%%).",
+        cpu_core_count, cpu_core_count > 1 ? "s" : "",
+        cur_runnable, cur_runnable * 100.0 / cpu_core_count);
 
     if (cpu_core_count > 1) {
 
@@ -7771,7 +7756,7 @@ int main(int argc, char** argv) {
   struct timezone tz;
 
   /* Allocate memory for hashmaps */
-  cksum2paths = kh_init(32);
+  cksum2fuzz = kh_init(32);
 
   SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>. Power schedules by <marcel.boehme@acm.org>\n");
 
@@ -7804,7 +7789,7 @@ int main(int argc, char** argv) {
           u8* c;
 
           if (sync_id) FATAL("Multiple -S or -M options not supported");
-          sync_id = optarg;
+          sync_id = ck_strdup(optarg);
 
           if ((c = strchr(sync_id, ':'))) {
 
@@ -7825,7 +7810,7 @@ int main(int argc, char** argv) {
       case 'S': 
 
         if (sync_id) FATAL("Multiple -S or -M options not supported");
-        sync_id = optarg;
+        sync_id = ck_strdup(optarg);
         break;
 
       case 'f': /* target file */
@@ -8130,7 +8115,7 @@ int main(int argc, char** argv) {
 
     if (stop_soon) break;
 
-    chooseNext_queue_cur();
+    queue_cur = queue_cur->next;
     current_entry++;
 
   }
@@ -8160,7 +8145,8 @@ stop_fuzzing:
   destroy_queue();
   destroy_extras();
   ck_free(target_path);
-  kh_destroy(32, cksum2paths);
+  ck_free(sync_id);
+  kh_destroy(32, cksum2fuzz);
 
   alloc_report();
 
